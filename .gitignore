@@ -1,0 +1,15 @@
+# Compiled binary
+opencode-remote-proxy
+
+# Personal launchd plist (contains credentials and local paths)
+com.opencode.remote-proxy.plist
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

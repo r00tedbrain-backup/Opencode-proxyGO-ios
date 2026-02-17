@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.opencode.remote-proxy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <!-- UPDATE: Set the full path to your compiled binary -->
+        <string>/path/to/opencode-remote-proxy</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>OPENCODE_PROXY_USER</key>
+        <!-- UPDATE: Set your desired username -->
+        <string>your_username</string>
+        <key>OPENCODE_PROXY_PASS</key>
+        <!-- UPDATE: Set your desired password. Use &amp; for & characters in XML -->
+        <string>your_strong_password</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/opencode-remote-proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/opencode-remote-proxy-error.log</string>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>
