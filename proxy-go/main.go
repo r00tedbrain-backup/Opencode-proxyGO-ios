@@ -23,7 +23,7 @@ const (
 	ProxyPort = "4096"
 
 	// Max failed auth attempts before temporary ban
-	MaxFailedAttempts = 5
+	MaxFailedAttempts = 20
 	BanDuration       = 15 * time.Minute
 )
 
@@ -239,6 +239,31 @@ func getClientIP(r *http.Request) string {
 	return host
 }
 
+// isBrowserAutoRequest returns true for requests the browser makes automatically
+// (favicons, manifests, assets, fonts, etc.) that should NOT count toward rate limiting.
+// These arrive without credentials on the first page load before the user can even
+// type their password, so counting them would instantly trigger the rate limiter.
+func isBrowserAutoRequest(path string) bool {
+	// Favicon and icon requests
+	if strings.Contains(path, "favicon") || strings.Contains(path, "apple-touch-icon") ||
+		strings.Contains(path, "social-share") {
+		return true
+	}
+	// Web manifest
+	if strings.HasSuffix(path, ".webmanifest") || strings.HasSuffix(path, "manifest.json") {
+		return true
+	}
+	// Static assets (JS, CSS, fonts, images)
+	if strings.HasPrefix(path, "/assets/") {
+		return true
+	}
+	// Preload scripts
+	if strings.Contains(path, "preload") {
+		return true
+	}
+	return false
+}
+
 // checkBasicAuth verifies the remote user credentials
 func checkBasicAuth(r *http.Request, remoteUser, remotePass string) bool {
 	auth := r.Header.Get("Authorization")
@@ -323,10 +348,14 @@ func main() {
 
 		// Check authentication
 		if !checkBasicAuth(r, remoteUser, remotePass) {
-			limiter.recordFail(clientIP)
-			remaining := MaxFailedAttempts - limiter.attempts[clientIP].count
-			if remaining > 0 {
-				log.Printf("[AUTH FAIL] %s from %s (%d attempts remaining)", r.URL.Path, clientIP, remaining)
+			// Only count deliberate login attempts toward rate limiting,
+			// not automatic browser requests (favicons, assets, manifest, fonts)
+			if !isBrowserAutoRequest(r.URL.Path) {
+				limiter.recordFail(clientIP)
+				remaining := MaxFailedAttempts - limiter.attempts[clientIP].count
+				if remaining > 0 {
+					log.Printf("[AUTH FAIL] %s from %s (%d attempts remaining)", r.URL.Path, clientIP, remaining)
+				}
 			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="OpenCode Remote"`)
 			w.WriteHeader(http.StatusUnauthorized)
