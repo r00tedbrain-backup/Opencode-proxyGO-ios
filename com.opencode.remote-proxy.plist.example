@@ -6,8 +6,11 @@
     <string>com.opencode.remote-proxy</string>
     <key>ProgramArguments</key>
     <array>
+        <!-- Uses bash -c with a small delay to let Tailscale/OpenCode start first -->
+        <string>/bin/bash</string>
+        <string>-c</string>
         <!-- UPDATE: Set the full path to your compiled binary -->
-        <string>/path/to/opencode-remote-proxy</string>
+        <string>sleep 5 &amp;&amp; exec /path/to/opencode-remote-proxy</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -17,14 +20,13 @@
         <key>OPENCODE_PROXY_PASS</key>
         <!-- UPDATE: Set your desired password. Use &amp; for & characters in XML -->
         <string>your_strong_password</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
     <key>StandardOutPath</key>
     <string>/tmp/opencode-remote-proxy.log</string>
     <key>StandardErrorPath</key>

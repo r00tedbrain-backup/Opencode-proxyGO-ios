@@ -25,6 +25,9 @@ const (
 	// Max failed auth attempts before temporary ban
 	MaxFailedAttempts = 20
 	BanDuration       = 15 * time.Minute
+
+	// How often to check for OpenCode desktop and Tailscale changes
+	PollInterval = 10 * time.Second
 )
 
 // DesktopTarget holds the detected OpenCode desktop server info
@@ -59,7 +62,6 @@ func (rl *rateLimiter) isBlocked(ip string) bool {
 		return false
 	}
 
-	// Check if ban has expired
 	if !info.bannedAt.IsZero() && time.Since(info.bannedAt) > BanDuration {
 		delete(rl.attempts, ip)
 		return false
@@ -91,7 +93,6 @@ func (rl *rateLimiter) recordSuccess(ip string) {
 	delete(rl.attempts, ip)
 }
 
-// Clean up expired bans periodically
 func (rl *rateLimiter) cleanup() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -176,7 +177,7 @@ func getLocalIP() string {
 }
 
 func getTailscaleIP() string {
-	// Method 1: Try the Tailscale CLI
+	// Method 1: Tailscale CLI
 	out, err := exec.Command("/Applications/Tailscale.app/Contents/MacOS/Tailscale", "ip", "-4").Output()
 	if err == nil {
 		ip := strings.TrimSpace(string(out))
@@ -185,7 +186,7 @@ func getTailscaleIP() string {
 		}
 	}
 
-	// Method 2: Read from the utun interface directly (Tailscale uses 100.x.y.z range)
+	// Method 2: utun interfaces
 	ifaces, err := net.Interfaces()
 	if err == nil {
 		for _, iface := range ifaces {
@@ -207,7 +208,6 @@ func getTailscaleIP() string {
 				if ip == nil || ip.To4() == nil {
 					continue
 				}
-				// Tailscale uses CGNAT range 100.64.0.0/10 (100.64.x.x - 100.127.x.x)
 				ipv4 := ip.To4()
 				if ipv4[0] == 100 && ipv4[1] >= 64 && ipv4[1] <= 127 {
 					return ipv4.String()
@@ -216,7 +216,7 @@ func getTailscaleIP() string {
 		}
 	}
 
-	// Method 3: Parse ifconfig output as last resort
+	// Method 3: ifconfig
 	ifconfigOut, err := exec.Command("bash", "-c", `ifconfig | grep "inet 100\." | awk '{print $2}'`).Output()
 	if err == nil {
 		ip := strings.TrimSpace(string(ifconfigOut))
@@ -240,24 +240,18 @@ func getClientIP(r *http.Request) string {
 }
 
 // isBrowserAutoRequest returns true for requests the browser makes automatically
-// (favicons, manifests, assets, fonts, etc.) that should NOT count toward rate limiting.
-// These arrive without credentials on the first page load before the user can even
-// type their password, so counting them would instantly trigger the rate limiter.
+// that should NOT count toward rate limiting.
 func isBrowserAutoRequest(path string) bool {
-	// Favicon and icon requests
 	if strings.Contains(path, "favicon") || strings.Contains(path, "apple-touch-icon") ||
 		strings.Contains(path, "social-share") {
 		return true
 	}
-	// Web manifest
 	if strings.HasSuffix(path, ".webmanifest") || strings.HasSuffix(path, "manifest.json") {
 		return true
 	}
-	// Static assets (JS, CSS, fonts, images)
 	if strings.HasPrefix(path, "/assets/") {
 		return true
 	}
-	// Preload scripts
 	if strings.Contains(path, "preload") {
 		return true
 	}
@@ -284,24 +278,29 @@ func checkBasicAuth(r *http.Request, remoteUser, remotePass string) bool {
 	return parts[0] == remoteUser && parts[1] == remotePass
 }
 
-func main() {
-	// Load credentials from environment
-	remoteUser, remotePass := getCredentials()
+// === PROXY STATE ===
+// Thread-safe proxy state that allows hot-swapping the backend target.
+// The proxy NEVER exits — if OpenCode is not running, it returns 503
+// and keeps polling until it comes back.
+type proxyState struct {
+	mu        sync.RWMutex
+	target    *DesktopTarget
+	proxy     *httputil.ReverseProxy
+	available bool
+}
 
-	// Detect desktop server
-	target := findDesktopServer()
-	if target == nil {
-		fmt.Println("  Error: OpenCode desktop app not found running.")
-		fmt.Println("  Open the OpenCode application on your Mac and try again.")
-		os.Exit(1)
-	}
+func newProxyState() *proxyState {
+	return &proxyState{}
+}
+
+func (ps *proxyState) updateTarget(target *DesktopTarget) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
 
 	targetURL, _ := url.Parse(fmt.Sprintf("http://%s:%s", target.Host, target.Port))
-
-	// Create reverse proxy
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
+	rp := httputil.NewSingleHostReverseProxy(targetURL)
+	originalDirector := rp.Director
+	rp.Director = func(req *http.Request) {
 		originalDirector(req)
 		auth := base64.StdEncoding.EncodeToString(
 			[]byte(fmt.Sprintf("%s:%s", target.User, target.Password)))
@@ -309,19 +308,65 @@ func main() {
 		req.Header.Set("Host", fmt.Sprintf("%s:%s", target.Host, target.Port))
 		req.Host = fmt.Sprintf("%s:%s", target.Host, target.Port)
 	}
-
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		log.Printf("[ERROR] Proxy error: %v", err)
-		newTarget := findDesktopServer()
-		if newTarget != nil && (newTarget.Port != target.Port || newTarget.Password != target.Password) {
-			log.Printf("[INFO] Desktop server changed to port %s, updating...", newTarget.Port)
-			target = newTarget
-			newURL, _ := url.Parse(fmt.Sprintf("http://%s:%s", newTarget.Host, newTarget.Port))
-			proxy = httputil.NewSingleHostReverseProxy(newURL)
-		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
-		fmt.Fprintf(w, `{"error":"OpenCode desktop not available"}`)
+		fmt.Fprintf(w, `{"error":"OpenCode desktop not available, will reconnect automatically"}`)
+	}
+
+	ps.target = target
+	ps.proxy = rp
+	ps.available = true
+}
+
+func (ps *proxyState) setUnavailable() {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	ps.available = false
+}
+
+func (ps *proxyState) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	if !ps.available || ps.proxy == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "10")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, `{"error":"OpenCode desktop not running. Waiting for it to start..."}`)
+		return
+	}
+
+	ps.proxy.ServeHTTP(w, r)
+}
+
+func (ps *proxyState) getTarget() *DesktopTarget {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return ps.target
+}
+
+func (ps *proxyState) isAvailable() bool {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return ps.available
+}
+
+func main() {
+	// Load credentials from environment
+	remoteUser, remotePass := getCredentials()
+
+	// Create proxy state (starts with no backend — never exits)
+	state := newProxyState()
+
+	// Try to detect desktop server at startup (non-blocking)
+	target := findDesktopServer()
+	if target != nil {
+		state.updateTarget(target)
+		log.Printf("[INIT] Desktop detected on port %s", target.Port)
+	} else {
+		log.Println("[INIT] OpenCode desktop not found, proxy will wait and auto-connect...")
 	}
 
 	// Main handler
@@ -330,7 +375,6 @@ func main() {
 
 		// Rate limiting check
 		if limiter.isBlocked(clientIP) {
-			log.Printf("[BLOCKED] %s %s from %s (rate limited)", r.Method, r.URL.Path, clientIP)
 			w.WriteHeader(http.StatusTooManyRequests)
 			fmt.Fprint(w, "Too many failed attempts. Try again later.")
 			return
@@ -348,8 +392,6 @@ func main() {
 
 		// Check authentication
 		if !checkBasicAuth(r, remoteUser, remotePass) {
-			// Only count deliberate login attempts toward rate limiting,
-			// not automatic browser requests (favicons, assets, manifest, fonts)
 			if !isBrowserAutoRequest(r.URL.Path) {
 				limiter.recordFail(clientIP)
 				remaining := MaxFailedAttempts - limiter.attempts[clientIP].count
@@ -372,7 +414,8 @@ func main() {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 
-		proxy.ServeHTTP(w, r)
+		// Forward to OpenCode (or return 503 if not available)
+		state.serveHTTP(w, r)
 	})
 
 	// Banner
@@ -384,7 +427,11 @@ func main() {
 	fmt.Println("    OpenCode Remote Proxy — Secured")
 	fmt.Println("  =============================================")
 	fmt.Println("")
-	fmt.Printf("  Desktop:    localhost:%s\n", target.Port)
+	if state.isAvailable() {
+		fmt.Printf("  Desktop:    localhost:%s\n", state.getTarget().Port)
+	} else {
+		fmt.Println("  Desktop:    waiting for OpenCode to start...")
+	}
 	fmt.Println("")
 	fmt.Printf("  Localhost:  http://localhost:%s\n", ProxyPort)
 	if tailscaleIP != "" {
@@ -404,9 +451,10 @@ func main() {
 		interfaces += " + " + localIP
 	}
 	fmt.Printf("  Listening:   %s (not 0.0.0.0)\n", interfaces)
+	fmt.Printf("  Poll:        every %v\n", PollInterval)
 	fmt.Println("")
 
-	// Build list of specific interfaces to bind to
+	// Build listen addresses
 	listenAddrs := []string{"127.0.0.1"}
 	if tailscaleIP != "" {
 		listenAddrs = append(listenAddrs, tailscaleIP)
@@ -415,19 +463,18 @@ func main() {
 		listenAddrs = append(listenAddrs, localIP)
 	}
 
-	// Track active servers and Tailscale listener state
+	// Track servers
 	var mu sync.Mutex
 	var servers []*http.Server
 	tailscaleListening := tailscaleIP != ""
 
-	// Helper to create and start a server on an address
 	startServer := func(addr string) *http.Server {
 		bindAddr := fmt.Sprintf("%s:%s", addr, ProxyPort)
 		srv := &http.Server{
 			Addr:         bindAddr,
 			Handler:      handler,
 			ReadTimeout:  30 * time.Second,
-			WriteTimeout: 0, // No timeout for SSE streams
+			WriteTimeout: 0,
 			IdleTimeout:  120 * time.Second,
 		}
 		go func() {
@@ -439,7 +486,7 @@ func main() {
 		return srv
 	}
 
-	// Start initial servers
+	// Start listeners immediately (even if OpenCode is not running yet)
 	for _, addr := range listenAddrs {
 		srv := startServer(addr)
 		servers = append(servers, srv)
@@ -459,33 +506,36 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Periodic: cleanup rate limiter, re-detect desktop, auto-bind Tailscale
+	// === MAIN LOOP: runs forever, never exits ===
+	// Polls for OpenCode desktop every 10s, reconnects on port/password change,
+	// auto-binds Tailscale, cleans up rate limiter
 	for {
-		time.Sleep(30 * time.Second)
+		time.Sleep(PollInterval)
 		limiter.cleanup()
 
-		// Re-detect desktop server (handles OpenCode restarts / port changes)
+		// --- Desktop auto-detection / reconnection ---
 		newTarget := findDesktopServer()
+		currentTarget := state.getTarget()
+
 		if newTarget != nil {
-			if newTarget.Port != target.Port || newTarget.Password != target.Password {
-				log.Printf("[INFO] Desktop re-detected on port %s", newTarget.Port)
-				target = newTarget
-				newURL, _ := url.Parse(fmt.Sprintf("http://%s:%s", newTarget.Host, newTarget.Port))
-				proxy = httputil.NewSingleHostReverseProxy(newURL)
-				proxy.Director = func(req *http.Request) {
-					req.URL.Scheme = newURL.Scheme
-					req.URL.Host = newURL.Host
-					auth := base64.StdEncoding.EncodeToString(
-						[]byte(fmt.Sprintf("%s:%s", target.User, target.Password)))
-					req.Header.Set("Authorization", "Basic "+auth)
-					req.Host = newURL.Host
+			if currentTarget == nil ||
+				newTarget.Port != currentTarget.Port ||
+				newTarget.Password != currentTarget.Password {
+				if currentTarget == nil {
+					log.Printf("[CONNECTED] OpenCode desktop found on port %s", newTarget.Port)
+				} else {
+					log.Printf("[RECONNECT] OpenCode changed: port %s -> %s", currentTarget.Port, newTarget.Port)
 				}
+				state.updateTarget(newTarget)
 			}
 		} else {
-			log.Println("[WARN] Desktop not detected, waiting...")
+			if state.isAvailable() {
+				log.Println("[DISCONNECTED] OpenCode desktop stopped, waiting for restart...")
+				state.setUnavailable()
+			}
 		}
 
-		// Auto-bind Tailscale if not yet listening
+		// --- Tailscale auto-bind ---
 		mu.Lock()
 		if !tailscaleListening {
 			tsIP := getTailscaleIP()

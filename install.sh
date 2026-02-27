@@ -64,7 +64,9 @@ cat > "$PLIST_DEST" <<PLIST
     <string>com.opencode.remote-proxy</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${BINARY_PATH}</string>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>sleep 5 &amp;&amp; exec ${BINARY_PATH}</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -72,14 +74,13 @@ cat > "$PLIST_DEST" <<PLIST
         <string>${OPENCODE_PROXY_USER}</string>
         <key>OPENCODE_PROXY_PASS</key>
         <string>${ESCAPED_PASS}</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
     <key>StandardOutPath</key>
     <string>/tmp/opencode-remote-proxy.log</string>
     <key>StandardErrorPath</key>

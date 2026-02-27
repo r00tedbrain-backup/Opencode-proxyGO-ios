@@ -43,14 +43,16 @@ iPhone/iPad          Tailscale VPN / LAN          Mac
 3. You authenticate with **your own credentials** at the proxy
 4. The proxy forwards requests to the desktop app, replacing the auth headers on-the-fly
 5. You see the **exact same sessions and chat history** as on the desktop
-6. If OpenCode restarts or changes port, the proxy **re-detects automatically** every 30 seconds
+6. If OpenCode restarts or changes port, the proxy **re-detects automatically** every 10 seconds
+7. The proxy **never exits** — if OpenCode is not running, it returns 503 and waits for it to start
 
 ## Features
 
 - **Zero config** — auto-detects OpenCode desktop server (port, password)
-- **Survives restarts** — re-detects if OpenCode changes port/password every 30s
+- **Never exits** — if OpenCode is not running, returns 503 and polls every 10s until it starts
+- **Survives restarts** — re-detects if OpenCode changes port/password automatically
 - **Secure** — credentials from environment variables, never hardcoded in binary
-- **Rate limiting** — 5 failed login attempts = 15 minute IP ban
+- **Rate limiting** — 20 failed login attempts = 15 minute IP ban (browser auto-requests excluded)
 - **Interface-bound** — listens only on localhost + Tailscale + LAN (not `0.0.0.0`)
 - **Tailscale auto-bind** — if Tailscale connects after proxy starts, it binds automatically
 - **Autostart** — launchd service starts the proxy at login
@@ -114,7 +116,8 @@ You should see output like:
   WiFi (LAN): http://192.168.1.x:4096
 
   Credentials: loaded from environment variables
-  Rate limit:  5 failed attempts -> 15m0s ban
+  Rate limit:  20 failed attempts -> 15m0s ban
+  Poll:        every 10s
   Listening:   127.0.0.1 + 100.x.y.z + 192.168.1.x (not 0.0.0.0)
 ```
 
@@ -272,8 +275,9 @@ The proxy will now work even with the strictest firewall setting because it has 
 | Constant | Default | Description |
 |---|---|---|
 | `ProxyPort` | `4096` | Port the proxy listens on |
-| `MaxFailedAttempts` | `5` | Failed login attempts before IP ban |
+| `MaxFailedAttempts` | `20` | Failed login attempts before IP ban |
 | `BanDuration` | `15 * time.Minute` | Duration of IP ban after max failures |
+| `PollInterval` | `10 * time.Second` | How often to check for OpenCode/Tailscale changes |
 
 To change these, edit `proxy-go/main.go` and rebuild:
 
@@ -325,7 +329,7 @@ ipconfig getifaddr en0
 
 ### "Too many failed attempts. Try again later."
 
-Your IP has been temporarily banned after 5 failed login attempts. You have two options:
+Your IP has been temporarily banned after 20 failed login attempts. You have two options:
 
 - **Wait 15 minutes** for the ban to expire automatically
 - **Restart the proxy** to clear all bans immediately:
@@ -379,7 +383,7 @@ This means you're connecting to a different OpenCode instance. Make sure:
 
 ### Proxy stops working after OpenCode restart
 
-The proxy auto-detects the new OpenCode server within 30 seconds. If it doesn't recover:
+The proxy never exits. If OpenCode stops, it returns 503 ("waiting for OpenCode to start") and auto-detects the new server within 10 seconds. If it doesn't recover:
 
 ```bash
 # Check the error log
@@ -401,7 +405,6 @@ cat /tmp/opencode-remote-proxy-error.log
 cat /tmp/opencode-remote-proxy.log
 
 # Common issues:
-# - OpenCode not running (exit code 1)
 # - Credentials not set in plist
 # - Binary path is wrong in plist
 # - Password has unescaped & character (use &amp; in XML)
@@ -439,7 +442,7 @@ rm -rf /path/to/opencode-remote-proxy
 
 - Credentials are **never hardcoded** in the binary — always loaded from environment variables
 - The binary binds to **specific interfaces only** (127.0.0.1, Tailscale IP, LAN IP) — never `0.0.0.0`
-- Rate limiting prevents brute-force attacks (5 attempts = 15 min IP ban)
+- Rate limiting prevents brute-force attacks (20 attempts = 15 min IP ban, browser auto-requests excluded)
 - When using Tailscale, traffic is encrypted end-to-end with WireGuard
 - The proxy password is **not** extractable from the binary via `strings`
 - The compiled binary only needs a macOS firewall exception for itself — no runtime (Node/Go) is exposed
@@ -455,8 +458,9 @@ The proxy finds the running OpenCode desktop app automatically:
 3. Reads the `OPENCODE_SERVER_PASSWORD` from the process environment via `ps eww`
 4. Connects to `127.0.0.1:<port>` with the extracted credentials
 
-Every 30 seconds, the proxy:
+Every 10 seconds, the proxy:
 - Re-checks the desktop server (handles OpenCode restarts, port changes, password changes)
+- If OpenCode is not running, the proxy stays up and returns 503 — it **never exits**
 - Cleans up expired rate-limit bans
 - Attempts to bind the Tailscale interface if not yet listening (handles Tailscale connecting after proxy starts)
 
