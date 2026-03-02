@@ -468,27 +468,38 @@ func main() {
 	var servers []*http.Server
 	tailscaleListening := tailscaleIP != ""
 
-	startServer := func(addr string) *http.Server {
+	startServer := func(addr string) (*http.Server, error) {
 		bindAddr := fmt.Sprintf("%s:%s", addr, ProxyPort)
+		// Pre-bind to verify the address is available before starting
+		ln, err := net.Listen("tcp", bindAddr)
+		if err != nil {
+			return nil, fmt.Errorf("bind %s: %w", bindAddr, err)
+		}
 		srv := &http.Server{
-			Addr:         bindAddr,
 			Handler:      handler,
 			ReadTimeout:  30 * time.Second,
 			WriteTimeout: 0,
 			IdleTimeout:  120 * time.Second,
 		}
 		go func() {
-			log.Printf("Proxy listening on %s", srv.Addr)
-			if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-				log.Printf("Server error on %s: %v", srv.Addr, err)
+			log.Printf("Proxy listening on %s", bindAddr)
+			if err := srv.Serve(ln); err != http.ErrServerClosed {
+				log.Printf("Server error on %s: %v", bindAddr, err)
 			}
 		}()
-		return srv
+		return srv, nil
 	}
 
 	// Start listeners immediately (even if OpenCode is not running yet)
 	for _, addr := range listenAddrs {
-		srv := startServer(addr)
+		srv, err := startServer(addr)
+		if err != nil {
+			log.Printf("[WARN] Could not bind %s: %v", addr, err)
+			if addr == tailscaleIP {
+				tailscaleListening = false
+			}
+			continue
+		}
 		servers = append(servers, srv)
 	}
 
@@ -540,10 +551,14 @@ func main() {
 		if !tailscaleListening {
 			tsIP := getTailscaleIP()
 			if tsIP != "" {
-				log.Printf("[INFO] Tailscale detected (%s), starting listener...", tsIP)
-				srv := startServer(tsIP)
-				servers = append(servers, srv)
-				tailscaleListening = true
+				srv, err := startServer(tsIP)
+				if err != nil {
+					log.Printf("[WARN] Tailscale IP %s detected but bind failed: %v (will retry)", tsIP, err)
+				} else {
+					log.Printf("[INFO] Tailscale listener started on %s", tsIP)
+					servers = append(servers, srv)
+					tailscaleListening = true
+				}
 			}
 		}
 		mu.Unlock()
